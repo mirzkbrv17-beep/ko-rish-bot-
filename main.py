@@ -6,6 +6,7 @@ import re
 from datetime import date
 
 import aiosqlite
+from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -774,7 +775,17 @@ async def tr_text(m: Message):
         await m.answer(f"<code>{to_russian(m.text)}</code>")
 
 
+async def health_server():
+    # Render Web Service port talab qiladi
+    app = web.Application()
+    app.add_routes([web.get("/", lambda r: web.Response(text="ok"))])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000"))).start()
+
+
 async def main():
+    await health_server()
     await db_init()
     for r in await q("SELECT key, cid FROM emoji"):
         EMOJI[r["key"]] = r["cid"]
