@@ -1,4 +1,5 @@
 import asyncio
+import io
 import logging
 import os
 import random
@@ -14,7 +15,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (CallbackQuery, InlineKeyboardButton,
+from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
@@ -533,13 +534,18 @@ async def menu(c: CallbackQuery, state: FSMContext):
 
 
 # ----- Profil ulash -----
+QR_KB = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="📷 QR orqali ulash", callback_data="login_qr")]])
+
 @router.callback_query(F.data == "login")
 async def login_start(c: CallbackQuery, state: FSMContext):
     await state.set_state(Login.phone)
     await c.message.answer(
         f"{pe('user')} Telefon raqamingizni xalqaro formatda yuboring (masalan: <code>+998901234567</code>).\n\n"
         "⚠️ Kod kelganda uni <b>raqamlar orasiga bo'sh joy qo'yib</b> yozing (masalan: <code>1 2 3 4 5</code>), "
-        "aks holda Telegram kodni bekor qiladi.")
+        "aks holda Telegram kodni bekor qiladi.\n\n"
+        "Kod kelmasa, QR tugmasidan foydalaning 👇",
+        reply_markup=QR_KB)
     await c.answer()
 
 
@@ -565,11 +571,61 @@ async def login_phone(m: Message, state: FSMContext):
     LOGIN[m.from_user.id] = {"client": client, "phone": phone, "hash": sent.phone_code_hash}
     await state.set_state(Login.code)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📩 SMS bilan qayta yuborish", callback_data="resend_code")]])
+        InlineKeyboardButton(text="📩 SMS bilan qayta yuborish", callback_data="resend_code")],
+        [InlineKeyboardButton(text="📷 QR orqali ulash", callback_data="login_qr")]])
     await m.answer(
         "📲 Kod yuborildi. U <b>Telegram ilovangizdagi «Telegram» (rasmiy) chatiga</b> keladi, "
         "SMS emas. Boshqa qurilmadagi Telegramni ham tekshiring.\n\n"
         "Kodni nuqta bilan yozing: <code>1.2.3.4.5</code>", reply_markup=kb)
+
+
+@router.callback_query(F.data == "login_qr")
+async def login_qr(c: CallbackQuery, state: FSMContext):
+    import qrcode
+    uid = c.from_user.id
+    await c.answer()
+    old = LOGIN.pop(uid, None)
+    if old:
+        try:
+            await old["client"].disconnect()
+        except Exception:
+            pass
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    await client.connect()
+    try:
+        qr = await client.qr_login()
+        for _ in range(5):
+            buf = io.BytesIO()
+            qrcode.make(qr.url).save(buf, format="PNG")
+            await c.message.answer_photo(
+                BufferedInputFile(buf.getvalue(), "qr.png"),
+                caption="📷 Ulamoqchi bo'lgan akkaunt Telegramida:\n"
+                        "<b>Sozlamalar → Qurilmalar → Qurilma ulash</b> ni bosing va shu QR ni skanerlang.\n"
+                        "⏳ 30 soniya ichida.")
+            try:
+                await qr.wait(30)
+                break
+            except asyncio.TimeoutError:
+                await qr.recreate()
+            except SessionPasswordNeededError:
+                LOGIN[uid] = {"client": client, "phone": "", "hash": ""}
+                await state.set_state(Login.password)
+                await c.message.answer("🔑 Ikki bosqichli parolni kiriting:")
+                return
+        else:
+            await client.disconnect()
+            await c.message.answer(f"{pe('no')} QR skanerlanmadi. Qaytadan urinib ko'ring.")
+            return
+    except SessionPasswordNeededError:
+        LOGIN[uid] = {"client": client, "phone": "", "hash": ""}
+        await state.set_state(Login.password)
+        await c.message.answer("🔑 Ikki bosqichli parolni kiriting:")
+        return
+    except Exception as e:
+        await client.disconnect()
+        await c.message.answer(f"{pe('no')} Xato: {e}")
+        return
+    await finish_login(c.message, state, client, uid)
 
 
 @router.callback_query(F.data == "resend_code")
@@ -586,8 +642,8 @@ async def resend_code(c: CallbackQuery):
     await c.answer()
 
 
-async def finish_login(m: Message, state: FSMContext, client):
-    uid = m.from_user.id
+async def finish_login(m: Message, state: FSMContext, client, uid: int = None):
+    uid = uid or m.from_user.id
     enc = FERNET.encrypt(client.session.save().encode()).decode()
     await set_user(uid, session=enc)
     if uid in CLIENTS:

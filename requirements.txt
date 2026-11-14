@@ -3,3 +3,4 @@ telethon>=1.36
 aiosqlite>=0.20
 cryptography>=42
 python-dotenv>=1.0
+qrcode[pil]>=7.4
