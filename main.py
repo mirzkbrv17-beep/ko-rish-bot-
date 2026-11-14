@@ -546,6 +546,14 @@ async def login_start(c: CallbackQuery, state: FSMContext):
 @router.message(Login.phone)
 async def login_phone(m: Message, state: FSMContext):
     phone = re.sub(r"[^\d+]", "", m.text or "")
+    if not phone.startswith("+"):
+        phone = "+" + phone
+    old = LOGIN.pop(m.from_user.id, None)
+    if old:
+        try:
+            await old["client"].disconnect()
+        except Exception:
+            pass
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
     try:
@@ -556,7 +564,26 @@ async def login_phone(m: Message, state: FSMContext):
         return
     LOGIN[m.from_user.id] = {"client": client, "phone": phone, "hash": sent.phone_code_hash}
     await state.set_state(Login.code)
-    await m.answer("Telegram yuborgan kodni kiriting (raqamlar orasiga bo'sh joy bilan):")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📩 SMS bilan qayta yuborish", callback_data="resend_code")]])
+    await m.answer(
+        "📲 Kod yuborildi. U <b>Telegram ilovangizdagi «Telegram» (rasmiy) chatiga</b> keladi, "
+        "SMS emas. Boshqa qurilmadagi Telegramni ham tekshiring.\n\n"
+        "Kodni nuqta bilan yozing: <code>1.2.3.4.5</code>", reply_markup=kb)
+
+
+@router.callback_query(F.data == "resend_code")
+async def resend_code(c: CallbackQuery):
+    d = LOGIN.get(c.from_user.id)
+    if not d:
+        return await c.answer("Avval telefon raqam yuboring", show_alert=True)
+    try:
+        sent = await d["client"].send_code_request(d["phone"], force_sms=True)
+        d["hash"] = sent.phone_code_hash
+        await c.message.answer("📩 Kod SMS orqali qayta yuborildi (kelishi 1-2 daqiqa olishi mumkin).")
+    except Exception as e:
+        await c.message.answer(f"{pe('no')} Xato: {e}")
+    await c.answer()
 
 
 async def finish_login(m: Message, state: FSMContext, client):
