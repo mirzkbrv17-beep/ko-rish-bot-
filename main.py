@@ -281,7 +281,7 @@ async def worker(uid: int):
             await set_user(uid, running=0)
             break
         try:
-            posts = [m async for m in client.iter_messages(u["channel"])
+            posts = [m async for m in client.iter_messages(int(u["channel"]))
                      if (m.message or m.media) and not m.action]
         except Exception as e:
             await notify(uid, f"{pe('no')} Kanalni o'qib bo'lmadi: {e}")
@@ -310,7 +310,7 @@ async def worker(uid: int):
                 if done:
                     continue
                 try:
-                    res = await client.forward_messages(gid, post.id, from_peer=u["channel"])
+                    res = await client.forward_messages(gid, post.id, from_peer=int(u["channel"]))
                     sm = res[0] if isinstance(res, list) else res
                     if sm:
                         SENT_IDS.setdefault((uid, gid), set()).add(sm.id)
@@ -620,7 +620,11 @@ async def chan_link(m: Message, state: FSMContext):
     except Exception as e:
         await m.answer(f"{pe('no')} Kanal topilmadi: {e}")
         return
-    await set_user(m.from_user.id, channel=ent.id)
+    if not isinstance(ent, Channel) or getattr(ent, "megagroup", False):
+        await m.answer(f"{pe('no')} Bu kanal emas. Kanal username'ini to'g'ri yuboring.")
+        return
+    from telethon.utils import get_peer_id
+    await set_user(m.from_user.id, channel=get_peer_id(ent))
     await state.clear()
     await m.answer(f"{pe('ok')} Kanal ulandi: <b>{getattr(ent, 'title', link)}</b>")
     await show_menu(m, m.from_user.id)
