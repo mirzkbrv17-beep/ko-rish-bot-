@@ -269,71 +269,82 @@ async def notify(uid, text):
         pass
 
 
+COUNT: dict[int, list] = {}   # uid -> [kun, bugungi forwardlar soni]
+
+
+def _count(uid, n=1):
+    today = date.today().isoformat()
+    if COUNT.get(uid, [None])[0] != today:
+        COUNT[uid] = [today, 0]
+    COUNT[uid][1] += n
+    return COUNT[uid][1]
+
+
 async def worker(uid: int):
+    """Eng kam ko'rishli pog'onani (100, 200, 300 ...) to'ldirguncha qayta-qayta forward qiladi."""
     log.info("worker start %s", uid)
+    batch_ids: list[int] = []
+    threshold = 0
+    rounds = 0
     while True:
         u = await get_user(uid)
         if not u or not u["running"] or not u["channel"]:
-            break
+            return
         client = await get_client(uid)
         if client is None:
             await notify(uid, f"{pe('no')} Profil sessiyasi eskirgan. Profilni qayta ulang.")
             await set_user(uid, running=0)
-            break
+            return
+        chan = int(u["channel"])
+
+        # 1) Postlarni yangilash: batch bo'sh bo'lsa yoki har 10 aylanishda to'liq o'qiladi
         try:
-            posts = [m async for m in client.iter_messages(int(u["channel"]))
-                     if (m.message or m.media) and not m.action]
+            if not batch_ids or rounds % 10 == 0:
+                posts = [m async for m in client.iter_messages(chan)
+                         if (m.message or m.media) and not m.action and m.views is not None]
+                views = {m.id: m.views for m in posts}
+                if not views or min(views.values()) >= TARGET_VIEWS:
+                    await set_user(uid, running=0)
+                    await notify(uid, f"{pe('ok')} Kanaldagi barcha postlar {TARGET_VIEWS:,} ko'rishga yetdi. Tarqatish to'xtatildi.")
+                    return
+                lowest = min(views.values())
+                threshold = min((lowest // 100 + 1) * 100, TARGET_VIEWS)
+                batch_ids = [i for i, v in views.items() if v < threshold]
+            else:
+                msgs = await client.get_messages(chan, ids=batch_ids)
+                batch_ids = [m.id for m in msgs if m and m.views is not None and m.views < threshold]
         except Exception as e:
             await notify(uid, f"{pe('no')} Kanalni o'qib bo'lmadi: {e}")
             await asyncio.sleep(300)
             continue
+        rounds += 1
+        if not batch_ids:        # pog'ona to'ldi -> keyingi pog'onani hisoblash
+            rounds = 0
+            continue
 
-        pending = [m for m in posts if (m.views or 0) < TARGET_VIEWS]
-        if not pending:
-            await set_user(uid, running=0)
-            await notify(uid, f"{pe('ok')} Kanaldagi barcha postlar {TARGET_VIEWS:,} ko'rishga yetdi. Tarqatish to'xtatildi.")
-            break
-
-        # Ko'rishi eng kam postlar birinchi: <100, keyin <200, <300 ...
-        pending.sort(key=lambda m: (m.views or 0, m.id))
+        # 2) Shu pog'onadagi barcha postlarni barcha guruhlarga forward qilish
         groups = [r["group_id"] for r in await q("SELECT group_id FROM sel WHERE user_id=?", (uid,))]
-        today = date.today().isoformat()
-
-        for post in pending:
+        for pid in sorted(batch_ids):
             for gid in groups:
                 u = await get_user(uid)
                 if not u or not u["running"]:
                     log.info("worker stop %s", uid)
                     return
-                done = await q("SELECT 1 FROM sent WHERE user_id=? AND post_id=? AND group_id=? AND day=?",
-                               (uid, post.id, gid, today), one=True)
-                if done:
-                    continue
                 try:
-                    res = await client.forward_messages(gid, post.id, from_peer=int(u["channel"]))
+                    res = await client.forward_messages(gid, pid, from_peer=chan)
                     sm = res[0] if isinstance(res, list) else res
                     if sm:
                         SENT_IDS.setdefault((uid, gid), set()).add(sm.id)
+                    _count(uid)
                 except FloodWaitError as e:
                     await asyncio.sleep(e.seconds + 1)
-                    continue
                 except SlowModeWaitError:
                     pass
                 except (ChatWriteForbiddenError, UserBannedInChannelError, ChatAdminRequiredError):
-                    # yozish uchun obuna talab qilinayotgan bo'lishi mumkin
                     await autojoin_from_recent(uid, client, gid)
                 except Exception as e:
-                    log.warning("forward %s -> %s: %s", post.id, gid, e)
-                await q("INSERT OR IGNORE INTO sent VALUES(?,?,?,?)",
-                        (uid, post.id, gid, today), commit=True)
+                    log.warning("forward %s -> %s: %s", pid, gid, e)
                 await asyncio.sleep(DELAY)
-
-        # Bugungi aylanish tugadi: yangi post / yangi kun uchun vaqti-vaqti bilan qayta tekshiradi
-        for _ in range(60):
-            await asyncio.sleep(10)
-            u = await get_user(uid)
-            if not u or not u["running"]:
-                return
 
 
 def start_worker(uid):
@@ -753,8 +764,8 @@ async def toggle_aj(c: CallbackQuery):
 async def stat(c: CallbackQuery):
     uid = c.from_user.id
     n = (await q("SELECT COUNT(*) n FROM sel WHERE user_id=?", (uid,), one=True))["n"]
-    s = (await q("SELECT COUNT(*) n FROM sent WHERE user_id=? AND day=?",
-                 (uid, date.today().isoformat()), one=True))["n"]
+    c = COUNT.get(uid)
+    s = c[1] if c and c[0] == date.today().isoformat() else 0
     u = await get_user(uid)
     await c.message.answer(
         f"{pe('stat')} <b>Holat</b>\nProfil: {'ulangan' if u['session'] else 'yo‘q'}\n"
